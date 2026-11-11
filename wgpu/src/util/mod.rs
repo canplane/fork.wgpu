@@ -170,6 +170,15 @@ pub fn pipeline_cache_key(adapter_info: &wgt::AdapterInfo) -> Option<String> {
             "wgpu_pipeline_cache_vulkan_{}_{}",
             adapter_info.vendor, adapter_info.device
         )),
+        // Metal names no vendor or device by number, so the GPU is told by its name.
+        wgt::Backend::Metal => Some(format!(
+            "wgpu_pipeline_cache_metal_{}",
+            adapter_info
+                .name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect::<String>()
+        )),
         _ => None,
     }
 }

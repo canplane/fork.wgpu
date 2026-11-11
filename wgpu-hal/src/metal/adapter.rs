@@ -1200,6 +1200,7 @@ impl super::CapabilitiesQuery {
             | F::EXTERNAL_TEXTURE;
 
         features.set(F::FLOAT32_FILTERABLE, self.supports_float_filtering);
+        features.set(F::PIPELINE_CACHE, self.supports_binary_archives);
         features.set(F::FLOAT32_BLENDABLE, true);
         features.set(F::INDIRECT_FIRST_INSTANCE, self.indirect_draw_dispatch);
         features.set(

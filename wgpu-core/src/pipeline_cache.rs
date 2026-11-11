@@ -233,6 +233,19 @@ fn adapter_key(adapter: &AdapterInfo) -> Result<[u8; 15], PipelineCacheValidatio
             ];
             Ok(adapter)
         }
+        wgt::Backend::Metal => {
+            // Metal names no vendor or device by number, so its GPU is told by its name.
+            let h: [u8; 8] = adapter
+                .name
+                .bytes()
+                .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+                })
+                .to_be_bytes();
+            Ok([
+                254, 254, 254, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 254, 254, 254, 254,
+            ])
+        }
         _ => Err(PipelineCacheValidationError::Unsupported),
     }
 }
