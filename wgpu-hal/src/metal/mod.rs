@@ -1381,8 +1381,28 @@ impl crate::DynCommandBuffer for CommandBuffer {}
 unsafe impl Send for CommandBuffer {}
 unsafe impl Sync for CommandBuffer {}
 
+/// A binary archive of compiled pipeline functions (`MTLBinaryArchive`). A pipeline
+/// made with it looks its functions up in it first, and adds them to it once made.
+/// `file` is where the archive was loaded from, which Metal may read for as long as
+/// the archive lives, so it is removed only when the cache goes.
 #[derive(Debug)]
-pub struct PipelineCache;
+pub struct PipelineCache {
+    archive: Retained<ProtocolObject<dyn objc2_metal::MTLBinaryArchive>>,
+    /// Adding functions to the archive and serializing it take turns.
+    turn: Mutex<()>,
+    file: Option<std::path::PathBuf>,
+}
+
+unsafe impl Send for PipelineCache {}
+unsafe impl Sync for PipelineCache {}
+
+impl Drop for PipelineCache {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
 
 impl crate::DynPipelineCache for PipelineCache {}
 

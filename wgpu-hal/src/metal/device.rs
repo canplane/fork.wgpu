@@ -1,5 +1,5 @@
-use alloc::{borrow::ToOwned as _, sync::Arc, vec::Vec};
-use core::{mem::align_of, ptr::NonNull};
+use alloc::{borrow::ToOwned as _, string::ToString as _, sync::Arc, vec::Vec};
+use core::{mem::align_of, ptr::NonNull, sync::atomic};
 
 use bytemuck::TransparentWrapper;
 use objc2::{
@@ -7,9 +7,12 @@ use objc2::{
     rc::{autoreleasepool, Retained},
     runtime::ProtocolObject,
 };
-use objc2_foundation::{ns_string, NSError, NSRange, NSString, NSUInteger};
+use objc2_foundation::{
+    ns_string, NSArray, NSError, NSProcessInfo, NSRange, NSString, NSUInteger, NSURL,
+};
 use objc2_metal::{
-    MTLAccelerationStructure, MTLAccelerationStructureInstanceOptions, MTLBuffer,
+    MTLAccelerationStructure, MTLAccelerationStructureInstanceOptions, MTLBinaryArchive,
+    MTLBinaryArchiveDescriptor, MTLBuffer,
     MTLCaptureManager, MTLCaptureScope, MTLCompileOptions, MTLComputePipelineDescriptor,
     MTLComputePipelineState, MTLCounterSampleBufferDescriptor, MTLCounterSet, MTLDepthClipMode,
     MTLDepthStencilDescriptor, MTLDevice, MTLFunction,
@@ -456,6 +459,35 @@ impl super::Device {
 
     pub fn raw_device(&self) -> &Retained<ProtocolObject<dyn MTLDevice>> {
         &self.shared.device
+    }
+}
+
+/// A file of its own under the system's temporary directory, through which an archive
+/// is loaded or serialized.
+fn archive_file() -> std::path::PathBuf {
+    static NEXT: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(std::format!("wgpu-pipeline-cache-{}-{n}", std::process::id()))
+}
+
+fn file_url(file: &std::path::Path) -> Option<Retained<NSURL>> {
+    Some(NSURL::fileURLWithPath(&NSString::from_str(file.to_str()?)))
+}
+
+impl super::PipelineCache {
+    /// The archives a pipeline made with the cache looks its functions up in.
+    fn archives(&self) -> Retained<NSArray<ProtocolObject<dyn MTLBinaryArchive>>> {
+        NSArray::from_retained_slice(core::slice::from_ref(&self.archive))
+    }
+
+    /// Adds a pipeline's functions to the archive. A function the archive refuses is
+    /// compiled again by the next pipeline that asks for it, so the refusal is dropped.
+    fn add(
+        &self,
+        add: impl FnOnce(&ProtocolObject<dyn MTLBinaryArchive>) -> Result<(), Retained<NSError>>,
+    ) {
+        let _turn = self.turn.lock();
+        let _ = add(&self.archive);
     }
 }
 
@@ -1743,17 +1775,26 @@ impl crate::Device for super::Device {
                 };
             }
 
-            // Create the pipeline from descriptor
-            let raw = match descriptor {
+            // Create the pipeline from descriptor. A standard pipeline looks its functions up
+            // in the cache's archive first, and adds them to it once made.
+            let cache = desc.cache.filter(|_| {
+                matches!(descriptor, MetalGenericRenderPipelineDescriptor::Standard(_))
+            });
+            if let (Some(cache), MetalGenericRenderPipelineDescriptor::Standard(d)) =
+                (cache, &descriptor)
+            {
+                d.setBinaryArchives(Some(&cache.archives()));
+            }
+            let raw = match &descriptor {
                 MetalGenericRenderPipelineDescriptor::Standard(d) => self
                     .shared
                     .device
-                    .newRenderPipelineStateWithDescriptor_error(&d),
+                    .newRenderPipelineStateWithDescriptor_error(d),
                 MetalGenericRenderPipelineDescriptor::Mesh(d) => self
                     .shared
                     .device
                     .newRenderPipelineStateWithMeshDescriptor_options_reflection_error(
-                        &d,
+                        d,
                         MTLPipelineOption::empty(),
                         None,
                     ),
@@ -1764,6 +1805,11 @@ impl crate::Device for super::Device {
                     format!("new_render_pipeline_state: {e:?}"),
                 )
             })?;
+            if let (Some(cache), MetalGenericRenderPipelineDescriptor::Standard(d)) =
+                (cache, &descriptor)
+            {
+                cache.add(|archive| archive.addRenderPipelineFunctionsWithDescriptor_error(d));
+            }
 
             self.counters.render_pipelines.add(1);
 
@@ -1854,6 +1900,11 @@ impl crate::Device for super::Device {
             if let Some(name) = desc.label {
                 descriptor.setLabel(Some(&NSString::from_str(name)));
             }
+            // The pipeline looks its function up in the cache's archive first, and adds it to it
+            // once made.
+            if let Some(cache) = desc.cache {
+                descriptor.setBinaryArchives(Some(&cache.archives()));
+            }
 
             let raw = self
                 .shared
@@ -1871,6 +1922,10 @@ impl crate::Device for super::Device {
                         format!("new_compute_pipeline_state: {e:?}"),
                     )
                 })?;
+
+            if let Some(cache) = desc.cache {
+                cache.add(|archive| archive.addComputePipelineFunctionsWithDescriptor_error(&descriptor));
+            }
 
             self.counters.compute_pipelines.add(1);
 
@@ -1905,13 +1960,86 @@ impl crate::Device for super::Device {
         unimplemented!("Ray tracing pipelines are unsupported on Metal")
     }
 
+    /// The archive is loaded from `desc.data` where that is given, through a file of its
+    /// own, since Metal loads an archive only from a URL. Data Metal refuses gives an
+    /// empty archive, as no data does.
     unsafe fn create_pipeline_cache(
         &self,
-        _desc: &crate::PipelineCacheDescriptor<'_>,
+        desc: &crate::PipelineCacheDescriptor<'_>,
     ) -> Result<super::PipelineCache, crate::PipelineCacheError> {
-        Ok(super::PipelineCache)
+        autoreleasepool(|_| {
+            let descriptor = MTLBinaryArchiveDescriptor::new();
+            let loaded = desc.data.and_then(|data| {
+                let file = archive_file();
+                std::fs::write(&file, data).ok()?;
+                let url = file_url(&file)?;
+                descriptor.setUrl(Some(&url));
+                match self.shared.device.newBinaryArchiveWithDescriptor_error(&descriptor) {
+                    Ok(archive) => Some((archive, file)),
+                    Err(_) => {
+                        let _ = std::fs::remove_file(&file);
+                        None
+                    }
+                }
+            });
+            let (archive, file) = match loaded {
+                Some((archive, file)) => (archive, Some(file)),
+                None => {
+                    descriptor.setUrl(None);
+                    let archive = self
+                        .shared
+                        .device
+                        .newBinaryArchiveWithDescriptor_error(&descriptor)
+                        .map_err(|_| crate::PipelineCacheError::Device(crate::DeviceError::Unexpected))?;
+                    (archive, None)
+                }
+            };
+            if let Some(name) = desc.label {
+                archive.setLabel(Some(&NSString::from_str(name)));
+            }
+            Ok(super::PipelineCache {
+                archive,
+                turn: Mutex::new(()),
+                file,
+            })
+        })
+    }
+    /// An archive holds code compiled for one GPU by one release of the system's Metal
+    /// compiler, so its key is the device's name and the system's version.
+    fn pipeline_cache_validation_key(&self) -> Option<[u8; 16]> {
+        let device = self.shared.device.name().to_string();
+        let system = NSProcessInfo::processInfo()
+            .operatingSystemVersionString()
+            .to_string();
+        let half = |seed: u64| {
+            [device.as_bytes(), &[0], system.as_bytes()]
+                .concat()
+                .iter()
+                .fold(seed, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+        };
+        let (a, b) = (half(0xcbf2_9ce4_8422_2325), half(0x6c62_272e_07bb_0142));
+        let mut key = [0; 16];
+        key[..8].copy_from_slice(&a.to_be_bytes());
+        key[8..].copy_from_slice(&b.to_be_bytes());
+        Some(key)
     }
     unsafe fn destroy_pipeline_cache(&self, _: super::PipelineCache) {}
+
+    /// The archive is serialized through a file of its own, since Metal serializes an
+    /// archive only to a URL.
+    unsafe fn pipeline_cache_get_data(&self, cache: &super::PipelineCache) -> Option<Vec<u8>> {
+        autoreleasepool(|_| {
+            let file = archive_file();
+            let url = file_url(&file)?;
+            let serialized = {
+                let _turn = cache.turn.lock();
+                cache.archive.serializeToURL_error(&url)
+            };
+            let data = serialized.ok().and_then(|()| std::fs::read(&file).ok());
+            let _ = std::fs::remove_file(&file);
+            data
+        })
+    }
 
     unsafe fn create_query_set(
         &self,
